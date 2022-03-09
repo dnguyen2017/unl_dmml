@@ -1,0 +1,227 @@
+---
+title: "assignment 3"
+author: "David Nguyen"
+date: "March 9, 2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(quanteda)
+library(glmnet)
+```
+
+
+```{r}
+# read in training data
+train <- read.csv("data/train.csv")
+test <- read.csv("data/test.csv")
+
+# combine training and testing data to produce unified corpus
+tweets <- rbind(train[,-ncol(train)], test)
+
+# get indices specifying start and stop of train/test data
+# use to subset when training and testing classifiers
+index_train <- c(1, nrow(train))
+index_test <- c((nrow(train) + 1), (nrow(train) + nrow(test)))
+```
+
+```{r}
+# make tokens
+tweet_corpus <- corpus(char_tolower(tweets$text))
+tweet_corpus[[6]]
+# tweet_corpus[[203]]
+# tweet_corpus[[329]]
+
+# remove punctuation, urls, and symbols
+# note, we are still able to keep hashtags and usernames
+tweet_tokens <- tokens(tweet_corpus, 
+                       remove_punct = TRUE, remove_url = TRUE, remove_symbols = TRUE)
+tweet_tokens[[6]]
+# tweet_tokens[[203]]
+# tweet_tokens[[329]]
+tweet_tokens_no_stop <- tokens_remove(tweet_tokens, pattern = stopwords("en"))
+tweet_tokens_no_stop[[6]]
+# tweet_tokens_no_stop[[203]]
+# tweet_tokens_no_stop[[329]]
+
+# get unigrams and bigrams
+tweet_ngrams <- tokens_ngrams(x = tweet_tokens_no_stop, n = 1:2)
+tweet_ngrams[[6]]
+# tweet_ngrams[[203]]
+# tweet_ngrams[[329]]
+```
+
+```{r}
+# make the design matrix (i.e., document term matrix)
+tweet_dfmat <- dfm(tweet_ngrams)
+dim(tweet_dfmat)
+
+# use tfidf weighting
+tweet_dfmat_tfidf <- dfm_tfidf(tweet_dfmat)
+```
+
+# Split training data into train & test
+
+Our objective for assignment #3 is to assess the performance of regularized logistic regression on out-of-sample (OOS) prediction. Since we do not know the true values for the test set, we can't use it for OOS prediction. Thus, we use an 80-20 split on the training data into a "training" and "test" set.
+
+```{r}
+# split training set into training and test set
+set.seed(123)
+prop_train <- 0.8
+train_ids <- sample(index_train[1]:index_train[2], size = round(prop_train * nrow(train)),replace = FALSE)
+test_ids <- (index_train[1]:index_train[2])[-train_ids]
+foldid <- sample(rep(1:10,length.out = length(train_ids))) # control which obs go to which folds in CV
+
+# subset design matrix according to train-test
+tweet_train_tfidf <- tweet_dfmat_tfidf[train_ids,]
+tweet_test_tfidf <- tweet_dfmat_tfidf[test_ids,]
+
+# subset known target values 
+tweet_train_target <- train$target[train_ids]
+tweet_test_target <- train$target[test_ids]
+
+nrow(tweet_train_tfidf) == length(tweet_train_target)
+nrow(tweet_test_tfidf) == length(tweet_test_target)
+
+head(tweet_train_tfidf)[,1:10]
+head(tweet_test_tfidf)[,1:10]
+```
+
+We use cross validation to select the regularization parameter, $\lambda$. We do not know a prior whether ridge, lasso, or something in between in best. So, we try three values of $\alpha = 0, 0.5, 1$ where $\alpha = 0$ is ridge regreession and $\alpha = 1$ is LASSO.
+
+```{r cache = TRUE}
+# cross validation with different values of alpha
+# lasso 
+cv1 <- cv.glmnet(x = tweet_train_tfidf,
+                         y = tweet_train_target,
+                         family = "binomial",
+                         alpha = 1 # lasso
+)
+
+# en
+cv.5 <- cv.glmnet(x = tweet_train_tfidf,
+                         y = tweet_train_target,
+                         family = "binomial",
+                         alpha = 0.5 # elastic net
+)
+
+# ridge
+cv0 <- cv.glmnet(x = tweet_train_tfidf,
+                         y = tweet_train_target,
+                         family = "binomial",
+                         alpha = 0 # ridge regression
+)
+```
+
+```{r}
+# https://glmnet.stanford.edu/articles/glmnet.html
+par(mfrow = c(2,2))
+plot(cv1); plot(cv.5); plot(cv0)
+plot(log(cv1$lambda)   , cv1$cvm , pch = 19, col = "red",
+     xlab = "log(Lambda)", ylab = cv1$name, xlim = c(-7, 4))
+points(log(cv.5$lambda), cv.5$cvm, pch = 19, col = "grey")
+points(log(cv0$lambda) , cv0$cvm , pch = 19, col = "blue")
+legend("topleft", legend = c("alpha= 1", "alpha= .5", "alpha 0"),
+       pch = 19, col = c("red","grey","blue"))
+```
+
+Here is the CV prediction errors (deviance) plotted vs the value of $\lambda$ for each value of $\alpha$. We can see that the LASSO and EN models have a clear minimum CV error, whereas ridge regression gives a strange result. Perhaps the grid of $\lambda$ is incorrect for ridge regression?
+
+Next, we compute performance metrics for the best of these three models using OOS prediction.
+
+We create confusion matrices and calculate:
+
+* precision: (# true positive) / (# true positives) + (# false positives)
+* recall: (# true positive) / (# true positives) + (# false negatives)
+* f1 score: 2 x ((Precision x Recall)/(Precision + Recall))
+    + The f1 score is the harmonic mean of the precision and recall. It is bounded between 0 and 1, with f1 = 1 meaning that the model has perfect precision and recall, and f1 = 0 meaning that either or both recall and precision is 0.
+
+Note, that by default we are using 0.5 as the probability threshold for assigning class labels. This is another parameter we use CV to find.
+
+```{r}
+# class prediction of best lasso model on training set
+pred_cv0 <-
+  as.integer(predict(cv0, newx = tweet_test_tfidf,
+        s = "lambda.min", type = "class"))
+pred_cv.5 <-
+  as.integer(predict(cv.5, newx = tweet_test_tfidf,
+        s = "lambda.min", type = "class"))
+pred_cv1 <-
+  as.integer(predict(cv1, newx = tweet_test_tfidf,
+        s = "lambda.min", type = "class"))
+
+
+# get confusion matrix
+cm_cv0 <- table(tweet_test_target, pred_cv0, dnn = list("True", "Predicted"))
+cm_cv.5 <- table(tweet_test_target, pred_cv.5, dnn = list("True", "Predicted"))
+cm_cv1 <- table(tweet_test_target, pred_cv1, dnn = list("True", "Predicted"))
+
+
+# calculate metrics: precision, recall, f1 score
+# ridge regression
+cm_cv0
+(prec_cv0 <- cm_cv0[2,2] / (cm_cv0[1,2] + cm_cv0[2,2]))
+(recall_cv0 <- cm_cv0[2,2] / (cm_cv0[2,1] + cm_cv0[2,2]))
+(f1_cv0 <- 2 *(prec_cv0 * recall_cv0 / (prec_cv0 + recall_cv0)))
+
+# alpha = 0.5
+cm_cv.5
+(prec_cv.5 <- cm_cv.5[2,2] / (cm_cv.5[1,2] + cm_cv.5[2,2]))
+(recall_cv.5 <- cm_cv.5[2,2] / (cm_cv.5[2,1] + cm_cv.5[2,2]))
+(f1_cv.5 <- 2 *(prec_cv.5 * recall_cv.5 / (prec_cv.5 + recall_cv.5)))
+
+# lasso
+cm_cv1
+(prec_cv1 <- cm_cv1[2,2] / (cm_cv1[1,2] + cm_cv1[2,2]))
+(recall_cv1 <- cm_cv1[2,2] / (cm_cv1[2,1] + cm_cv1[2,2]))
+(f1_cv1 <- 2 *(prec_cv1 * recall_cv1 / (prec_cv1 + recall_cv1)))
+```
+
+```{r}
+knitr::knit_exit()
+```
+
+
+```{r }
+ridge_tfidf <- cv.glmnet(x = tweet_dfmat_tfidf[index_train[1]:index_train[2],],
+                         y = train$target,
+                         family = "binomial",
+                         alpha = 0 # ridge regression
+)
+
+lasso_tfidf <- cv.glmnet(x = tweet_dfmat_tfidf[index_train[1]:index_train[2],],
+                         y = train$target,
+                         family = "binomial",
+                         alpha = 1 # lasso
+)
+
+
+```
+
+```{r}
+plot(ridge_tfidf)
+plot(lasso_tfidf)
+```
+
+```{r}
+# get best lasso model
+lasso_tfidf$lambda.min
+
+# class prediction of best lasso model on training set
+pred_lasso <-
+  as.integer(predict(lasso_tfidf, newx = tweet_dfmat_tfidf[index_train[1]:index_train[2],],
+        s = "lambda.min", type = "class"))
+# get confusion matrix
+lasso_cm <- table(train$target, pred_lasso, dnn = list("True", "Predicted"))
+lasso_cm
+
+# calculate metrics: precision, recall, f1 score
+(lasso_prec <- lasso_cm[2,2] / (lasso_cm[1,2] + lasso_cm[2,2]))
+(lasso_recall <- lasso_cm[2,2] / (lasso_cm[2,1] + lasso_cm[2,2]))
+(lasso_f1 <- 2 *(lasso_prec * lasso_recall / (lasso_prec + lasso_recall)))
+```
